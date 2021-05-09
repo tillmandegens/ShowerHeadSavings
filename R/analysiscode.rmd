@@ -1,1 +1,1983 @@
+---
+title: "Low Flow Gas Showerhead Analysis"
+author: "Tillman Degens and Gina Saraswati for Dan Rubado, Energy Trust of Oregon"
+date: "9/18/2020"
+output: github_document
+---
 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(odbc)
+library(dplyr)
+library(knitr)
+library(stringr)
+library(ggplot2)
+library(kableExtra)
+library(scales)
+library(purrr)
+library(janitor)
+library(cem)
+library(snakecase)
+library(readxl)
+library(readr)
+library(DBI)
+library(tidycensus)
+library(stargazer)
+library(broom)
+
+```
+
+
+\pagebreak
+
+# Background and Introduction
+
+Low flow showerheads and shower wands are major gas and electric efficiency measures that have been the backbone of Energy Trust’s residential program cost-effectiveness for the past decade. These devices are simple, relatively inexpensive, easy to install, and durable.The technology has been very stable over the past 30 years with relatively little technical design innovation. These devices save energy in homes by reducing the flow rate of hot water during a shower, theoretically reducing the amount of hot water used in a home. The amount of hot water saved, and thus energy, is dependent on the utilization level of an individual shower and the percent reduction in water flow achieved by the efficient device installed in the shower. It also depends on the behavioral response of the occupants and whether they change their shower length or frequency after installing the low flow device.
+
+
+Approximately 30,000 homes were identified to which Energy Trust had sent an Energy Saver Kit (ESK), containing a showerhead or shower wand, from 2013 to 2018. The inclusion criteria were:  
+
+  * ESK with low flow device sent to an individual address 
+  * Single-family site built or manufactured homes 
+  * Gas water heating fuel 
+
+Energy Trust’s online impact evaluation platform, developed by Recurve Analytics was used to match the ESK project sites to gas utility billing data. The focus was on gas savings in homes with gas water heating fuel to simplify the analysis. The Recurve platform was used to conduct three primary analytical tasks: 
+
+  * Develop a matched comparison group and future participant comparison group
+  * Develop weather normalized annual gas usage estimates for all participant and comparison group homes for the baseline and 
+  * Estimate the overall gas impact of ESKs containing low flow devices sent to single-family homes with gas water heating fuel 
+  
+The purpose of this report is initial exploratory analysis to assess the OpenEE data provided by Recurve as well as information from ETO's Project Tracking data to evaluate the overall gas savings for residential showerheads while isolating the impact from other measures that were installed at each home. 
+
+
+## Research Goals
+
+* Determine the overall average annual gas savings per showerhead (all types included in an ESK)
+  + Per showerhead shipped 
+* Determine the average annual gas savings per device shipped and per device installed by: 
+  + Product type (showerhead versus shower wand)
+  + Installation period 
+  + Home size category 
+  + Home type (site built versus manufactured homes)(This was taken out due to insufficient data)
+  + Home vintage category 
+  + Gas usage category 
+  + Geographic region 
+  + Household demographic factors (e.g., income category, number of occupants) 
+
+
+
+# Data Description and Summary Statistics
+
+
+The data used in this analysis comes from 3 main sources: 
+
+* The original Recurve dataset which includes estimated annualized therms that are calculated from the site-level regression coefficients using TMY3 data as the weather inputs. Each row of observation has a unique alphanumeric site ID which can be matched to the same site within Energy Trust's internal data warehouse.
+* Site characteristic information from CRM and PT such as square footage and building vintage. This information can be matched to the sample from the Recurve data based on the site ID. 
+* Census tract level information for average household size and median household income based on ACS 2018
+
+## Description of Data
+
+
+__Description of some of the fields within the Recurve Dataset:__
+
+* site = unique alphanumeric site ID that can be matched to UCI and Project Tracking
+* baseline_base_load = weather normalized (using TMY3) annual base load gas consumption in therms during the baseline period (12 calendar months prior to intervention)
+* baseline_predicted_usage = weather normalized annual gas consumption in therms during the baseline period
+* reporting_base_load = weather normalized annual base load gas consumption in therms during the reporting period (12 calendar months following the intervention)
+* reporting_predicted_usage = weather normalized annual gas consumption in therms during the reporting period
+* modeled_savings = weather normalized change in annual gas consumption in therms, aka DNAC, from baseline period to reporting period
+* portofolio_type = site type of the home (treated, potential control, future participant)
+
+Note that:  modeled_savings = reporting_predicted_usage - baseline_predicted_usage
+
+__Study Group Definitions (portofolio_type):__
+
+* treatment = the treatment group consists of participant homes that received an ESK. 
+  + These may be referred to as participants, ESK recipients, or treatment homes, interchangeably. 
+  
+* individual_matched = the site-level matched non-participant comparison group.
+  + These homes were selected from a large pool of candidate residential sites with gas utility meters from Energy Trust’s Utility Customer Information (UCI) database that did not receive an ESK. 
+  + These homes did not participate in any measures during the analysis period.
+  + Non-participant comparison sites were matched to each treatment site based on their monthly gas consumption in the baseline period. 
+  + Candidate non-participant homes were matched to each treatment home, based on baseline period monthly gas consumption.
+  + For each treatment home, the five closest matches within the same zip code were selected to form the comparison group. 
+  
+* stratified_future_participants = for each portfolio year of treatment sites, participants from future years, i.e. the following two years (skipping the year immediately following the intervention) are selected as a comparison group.
+  + Once the pool is identified for a given program year, stratified sampling is used to select a subset of future participants that has a baseline annual gas usage distribution similar to the treatment group.
+  + This group of future participants is then used as an alternative comparison group, when the sample size is sufficient. Gas usage for the future participant comparison group homes is analyzed for the same time period as the treatment homes, prior to ESKs being delivered to them.
+  + The primary benefit is that it is composed of homes that participated in the same measure in a different year, so it eliminates selection bias. Using this group gives us a form of experimental study design. Sometimes the number of future participant sites is not sufficient to conduct a robust analysis, though, and other times the program has changed sufficiently over time that they aren't that representative of past participant sites.
+
+```{r,echo=FALSE,message=FALSE,warning=FALSE}
+
+setwd("C:/Users/tillm/OneDrive/Desktop/Github")
+#getting location and name of data file
+file_input <- "data.txt"
+
+#reading input file as data frame
+dt <- read_delim(file_input, "|", 
+                 escape_double = FALSE, 
+                 col_types = cols(geoid = col_character()), 
+                 trim_ws = TRUE)
+
+#renaming a few of the columns in original data file
+showerheadsites <- dt %>%
+  mutate(OtherMeasWorkingTherms= workingtherms_total - (thermswand + thermsaerator + thermsshowerhead ))%>%
+  rename(ShowerWandQty = qtywand,
+         ShowerHeadQty = qtyshowerhead,
+         AeratorQty = qtyaerator,
+         Region = energytrustregion,
+         MarketSubType = marketsubtypename,
+         SqFt = sqft,
+         YearBuilt = yearbuilt,
+         InstalledYear = portfolio_year)
+
+#select only relevant columns and filter out sites with missing value
+Analysisdata<- showerheadsites %>%
+  select(project, site, SqFt, InstalledYear, 
+         portfolio_type, YearBuilt, ShowerHeadQty,
+         ShowerWandQty, AeratorQty, Region, geoid, 
+         MarketSubType, baseline_predicted_usage, reporting_predicted_usage,
+         OtherMeasWorkingTherms, markettypename, 
+         waterheatingfuel, modeled_savings, 
+         likely_gas_water_heating, project_installed_date) %>%
+  filter(!is.na(portfolio_type)) %>% # looks like none have missing study group categorization
+  filter(!is.na(modeled_savings)) %>% # none had missing modeled savings
+  mutate(OtherMeasureList = ifelse(OtherMeasWorkingTherms >1,"TRUE", "FALSE"))
+
+  
+#getting census tract level info  
+census_api_key("0faaf1131ae01fb7d6240e1907fbdb80cd36344b")
+acs <- get_acs(geography = "tract", 
+               variables = c(AvgHHSize = "B25010_001",
+                             MedHHIncPast12M = "B19013_001"
+                             ), 
+               state = "OR",
+               year = 2018,
+               geometry = FALSE)
+
+ACS2018 <- acs %>%
+  select(GEOID,variable,estimate) %>%
+  spread(key = variable, value = estimate)%>%
+  rename(geoid = GEOID)  
+
+#getting census tract of sites
+Analysisdata <- Analysisdata %>%
+  mutate(geoid = str_sub(geoid,1,11))
+
+#joining census tract level info with analysis data
+Analysisdata <- Analysisdata %>%
+  left_join(ACS2018, by ="geoid")
+
+
+```
+
+  
+## Summary Statistics
+
+
+```{r,echo=FALSE}
+
+#output table for summary statistics of study groups
+
+Analysisdata %>%
+  tabyl(portfolio_type) %>%
+  adorn_totals() %>%
+  adorn_pct_formatting(digits = 2) %>%
+  kable(format = "latex", booktabs = TRUE,
+        col.names = c("Site Type","n","Percent"),
+        caption = "Number of Sites in Each Study Group Within Recurve Sample",
+        format.args = list(big.mark= ",")) %>%
+  kable_styling(latex_options = "HOLD_position")
+
+```
+
+
+```{r,echo=FALSE,eval=FALSE,warning=FALSE,message=FALSE}
+
+# run this code chunk in the console 
+# copy the latex script into the markdown section
+# add commas to large numbers where appropriate
+Analysisdata %>%
+  mutate(InstalledYear= as.factor(InstalledYear)) %>%
+  tabyl(InstalledYear,portfolio_type) %>%
+  adorn_totals(where = c("row","col")) %>% 
+  adorn_percentages(denominator = "col") %>% 
+  adorn_pct_formatting(digits = 2) %>% 
+  adorn_ns(position = "front") %>%
+  kable(format = "latex", booktabs = TRUE,
+        #col.names = c("Site Type","n","Percent"),
+        caption = "Number of Treated and Control Sites in each Portfolio Year",
+        format.args = list(big.mark= ",")) %>%
+  kable_styling(latex_options = "HOLD_position")
+
+```
+
+
+\begin{table}[H]
+
+\caption{\label{tab:}Number of Treated and Control Sites in each Portfolio Year}
+\centering
+\begin{tabular}[t]{lllll}
+\toprule
+InstalledYear & individual\_matched & stratified\_future\_participants & treatment & Total\\
+\midrule
+2013 & 16,788  (17.16\%) & 3,198  (24.87\%) & 3,468  (17.19\%) & 23,454  (17.92\%)\\
+2014 & 32,525  (33.24\%) & 3,096  (24.08\%) & 6,625  (32.84\%) & 42,246  (32.28\%)\\
+2015 & 20,273  (20.72\%) & 2,862  (22.26\%) & 4,127  (20.46\%) & 27,262  (20.83\%)\\
+2016 & 13,697  (14.00\%) & 2,564  (19.94\%) & 2,805  (13.90\%) & 19,066  (14.57\%)\\
+2017 & 10,621  (10.86\%) & 1,137   (8.84\%) & 2,326  (11.53\%) & 14,084  (10.76\%)\\
+2018 & 3,933   (4.02\%) & 0   (0.00\%) & 824   (4.08\%) & 4,757   (3.63\%)\\
+Total & 97,837 (100.00\%) & 12,857 (100.00\%) & 20,175 (100.00\%) & 130,869 (100.00\%)\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+
+```{r,echo=FALSE}
+
+RecurveSum1 <- Analysisdata %>%
+  group_by(portfolio_type) %>%
+  summarise(N = n(),
+            Mean = mean(baseline_predicted_usage),
+            Max = max(baseline_predicted_usage),
+            Min = min(baseline_predicted_usage),
+            Sum = sum(baseline_predicted_usage),
+            StdDev = sd(baseline_predicted_usage)) #%>%
+#mutate(Obs = "BaselinePeriod")
+RecurveSum2 <- Analysisdata %>%
+  group_by(portfolio_type) %>%
+  summarise(N = n(),        
+            Mean = mean(reporting_predicted_usage),
+            Max = max(reporting_predicted_usage),
+            Min = min(reporting_predicted_usage),
+            Sum = sum(reporting_predicted_usage),
+            StdDev = sd(reporting_predicted_usage)) #%>%
+#mutate(Obs = "ReportingPeriod")
+RecurveSummary <- rbind(RecurveSum1,RecurveSum2) 
+kable(RecurveSummary, format = "latex", booktabs = TRUE,
+      caption = "Weather Normalized (TMY3) Predicted Annual Therms",
+      format.args = list(big.mark= ",")) %>%
+  kable_styling(latex_options = c("HOLD_position","scale_down")) %>%
+  pack_rows("Baseline Period", 1,3) %>%
+  pack_rows("Reporting Period",4,6)
+
+
+Analysisdata %>%
+  group_by(portfolio_type) %>%
+  summarise(N = n(),
+            avg_baseline = mean(modeled_savings),
+            max_baseline = max(modeled_savings),
+            min_baseline = min(modeled_savings),
+            sum_baseline = sum(modeled_savings),
+            sd_baseline = sd(modeled_savings)) %>% 
+  kable(format = "latex", booktabs = TRUE,
+        #align = "c",
+        col.names = c("Site Type","N","mean","max","min","sum","sd"),
+        caption = "Weather Normalized Modeled Annual Savings in Therms",
+        format.args = list(big.mark= ",")) %>%
+  kable_styling(latex_options = c("HOLD_position","scale_down")) 
+
+
+
+```
+
+
+
+```{r,echo=FALSE,eval=FALSE}
+
+# From Project Tracking
+
+#run code chunk in console
+#copy over the generated latex script into markdown section
+#add comma to large numbers
+Analysisdata %>%
+  filter(portfolio_type == "treatment")%>%
+  mutate(InstalledYear = as.factor(InstalledYear)) %>%
+  tabyl(InstalledYear, ShowerHeadQty) %>%
+  adorn_totals(where = c("row","col")) %>% 
+  adorn_percentages(denominator = "col") %>% 
+  adorn_pct_formatting(digits = 2) %>% 
+  adorn_ns(position = "front") %>%
+  kable(format = "latex", booktabs = TRUE,
+        caption = "Shower Heads by Installation Year Among ESK Recipient",
+        format.args = list(big.mark= ",")) %>%
+  kable_styling(latex_options = c("HOLD_position","Scale_down"))
+
+#run code chunk in console
+#copy over the generated latex script into markdown section
+#add comma to large numbers
+Analysisdata %>%
+  filter(portfolio_type == "treatment")%>%
+  mutate(InstalledYear = as.factor(InstalledYear)) %>%
+  tabyl(InstalledYear, ShowerWandQty) %>%
+  adorn_totals(where = c("row","col")) %>% 
+  adorn_percentages(denominator = "col") %>% 
+  adorn_pct_formatting(digits = 2) %>% 
+  adorn_ns(position = "front") %>%
+  kable(format = "latex", booktabs = TRUE,
+        caption = "Shower Wands by Installation Year Among ESK Recipient",
+        format.args = list(big.mark= ",")) %>%
+  kable_styling(latex_options = c("HOLD_position","Scale_down"))
+
+```
+
+
+
+\begin{table}[H]
+
+\caption{\label{tab:}Shower Heads by Installation Year}
+\centering
+\resizebox{\linewidth}{!}{
+\begin{tabular}[t]{lllllll}
+\toprule
+InstalledYear & 0 & 1 & 2 & 4 & 6 & Total\\
+\midrule
+2013 & 42   (7.65\%) & 738  (15.00\%) & 2,680  (18.23\%) & 7 (100.00\%) & 1 (100.00\%) & 3,468  (17.19\%)\\
+2014 & 31   (5.65\%) & 1,510  (30.69\%) & 5,084  (34.59\%) & 0   (0.00\%) & 0   (0.00\%) & 6,625  (32.84\%)\\
+2015 & 2   (0.36\%) & 847  (17.22\%) & 3,278  (22.30\%) & 0   (0.00\%) & 0   (0.00\%) & 4,127  (20.46\%)\\
+2016 & 0   (0.00\%) & 487   (9.90\%) & 2,318  (15.77\%) & 0   (0.00\%) & 0   (0.00\%) & 2,805  (13.90\%)\\
+2017 & 308  (56.10\%) & 937  (19.04\%) & 1,081   (7.35\%) & 0   (0.00\%) & 0   (0.00\%) & 2,326  (11.53\%)\\
+2018 & 166  (30.24\%) & 401   (8.15\%) & 257   (1.75\%) & 0   (0.00\%) & 0   (0.00\%) & 824   (4.08\%)\\
+Total & 549 (100.00\%) & 4,920 (100.00\%) & 14,698 (100.00\%) & 7 (100.00\%) & 1 (100.00\%) & 20,175 (100.00\%)\\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+
+
+
+\begin{table}[H]
+
+\caption{\label{tab:}Shower wands by Installation Year}
+\centering
+\resizebox{\linewidth}{!}{
+\begin{tabular}[t]{llllllll}
+\toprule
+InstalledYear & 0 & 1 & 2 & 3 & 4 & 6 & Total\\
+\midrule
+2013 & 3,393  (18.29\%) & 46   (2.89\%) & 24  (82.76\%) & 1 (100.00\%) & 3 (100.00\%) & 1 (100.00\%) & 3468  (17.19\%)\\
+2014 & 6,572  (35.43\%) & 48   (3.01\%) & 5  (17.24\%) & 0   (0.00\%) & 0   (0.00\%) & 0   (0.00\%) & 6625  (32.84\%)\\
+2015 & 4,124  (22.24\%) & 3   (0.19\%) & 0   (0.00\%) & 0   (0.00\%) & 0   (0.00\%) & 0   (0.00\%) & 4,127  (20.46\%)\\
+2016 & 2,805  (15.12\%) & 0   (0.00\%) & 0   (0.00\%) & 0   (0.00\%) & 0   (0.00\%) & 0   (0.00\%) & 2,805  (13.90\%)\\
+2017 & 1,338   (7.21\%) & 988  (61.98\%) & 0   (0.00\%) & 0   (0.00\%) & 0   (0.00\%) & 0   (0.00\%) & 2,326  (11.53\%)\\
+2018 & 315   (1.70\%) & 509  (31.93\%) & 0   (0.00\%) & 0   (0.00\%) & 0   (0.00\%) & 0   (0.00\%) & 824   (4.08\%)\\
+Total & 18,547 (100.00\%) & 1,594 (100.00\%) & 29 (100.00\%) & 1 (100.00\%) & 3 (100.00\%) & 1 (100.00\%) & 20,175 (100.00\%)\\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+__Analysis Groups__
+
+The three groups, treatment, matched and future participants all had building and demographics data drawn from Energy Trust’s customer relations management (CRM) database. It is expected that the treatment and future participants will have similar levels CRM data available. The matched participant group is expected to have lower levels of building characteristics data available as this group of households have not all participated in Energy Trust programs. However, a significant number has participated in one or another Energy Trust program over time and the CRM data will include this data. This means for models including square footage or building type variables the matched participant group will only include those households for which the CRM had data available
+
+
+
+```{r, echo=FALSE, warning=FALSE,message=FALSE}
+
+#check install year
+Analysisdata %>%
+  mutate(InstalledYear = as.factor(InstalledYear)) %>%
+  tabyl(InstalledYear,portfolio_type) %>%
+  adorn_totals(where = c("row","col")) %>% 
+  adorn_percentages(denominator = "col") %>% 
+  adorn_pct_formatting(digits = 2) %>% 
+  adorn_ns(position = "front") %>%
+  kable(format = "latex", booktabs = TRUE,
+        caption = "Installation Year for each Site Type",
+        format.args = list(big.mark= ",")) %>%
+  kable_styling(latex_options = c("HOLD_position","scale_down"))
+
+#check water heating fuel from PT and Recurve
+Analysisdata %>% 
+  tabyl(waterheatingfuel,likely_gas_water_heating) %>%
+  adorn_totals(where = c("row","col")) %>% 
+  adorn_percentages(denominator = "col") %>% 
+  adorn_pct_formatting(digits = 2) %>% 
+  adorn_ns(position = "front") %>%
+  kable(format = "latex", booktabs = TRUE,
+        col.names = c("Water Heating Fuel (SitesPT)","Not Likely Gas (Recurve)", "Likely Gas (Recurve)","Total"),
+        caption = "Water Heating Fuel",
+        format.args = list(big.mark= ",")) %>%
+  kable_styling(latex_options = c("HOLD_position","scale_down"))
+
+Analysisdata %>%
+  mutate(HasOtherGasMeasure = ifelse(is.na(OtherMeasureList),FALSE,TRUE)) %>%
+  tabyl(HasOtherGasMeasure,portfolio_type) %>%
+  adorn_totals(where = c("row","col")) %>% 
+  adorn_percentages(denominator = "col") %>% 
+  adorn_pct_formatting(digits = 2) %>% 
+  adorn_ns(position = "front") %>%
+  kable(format = "latex", booktabs = TRUE,
+        caption = "Other Measures Installed") %>%
+  kable_styling(latex_options = c("HOLD_position","scale_down"))
+
+Analysisdata %>% 
+  tabyl(Region,portfolio_type) %>%
+  adorn_totals(where = c("row","col")) %>% 
+  adorn_percentages(denominator = "col") %>% 
+  adorn_pct_formatting(digits = 2) %>% 
+  adorn_ns(position = "front") %>%
+  kable(format = "latex", booktabs = TRUE,
+        caption = "Study Groups by Region") %>%
+  kable_styling(latex_options = c("HOLD_position","scale_down"))
+
+```
+
+
+
+# Modelling Approach
+
+__Base Model__
+
+The initial analysis plan was to look at quantities of aerators, showerheads and shower wands installed. A review of the quantity of measures provided to the households in the six year analysis period indicated that there was insufficient variance in quantities provided  to warrant such an upproach.  Only 364, of the more than 19,000 treated homes in the analysis set did not receive an aerator and for those that did receive an aerator the overwhelming majority received either three or four. In the case of showerheads most of the households received either one or two and only very few received more than one shower wand. 
+This led to the following model specification:
+
+
+$$\text{Base Model}: Savings= \beta_0 + \beta_1X_1 + \beta_2X_2 + \epsilon$$
+
+where the following applies to both comparison groups:
+
+* $Savings$ = modeled_savings
+* $X_1$ = RecievedSH, which is a dummy variable representing homes which recieved showerheads and is set to zero for the comparison homes
+* $X_2$ = RecievedSW, which is a dummy variable representing homes which recieved shower wands and is set to zero for the comparison homes
+* $e$ = residual error
+
+
+__Modified model with interaction terms__
+
+
+A modified version for each of the comparison groups which includes interaction terms with categorical/factor/binary variables for the following site characteristics:
+
+* Installation Period
+* House Size (in square feet)
+* House vintage (year it was built)
+* Gas use (in therms) during baseline period
+* Region
+* Type of structure (site built vs manufactured home)(After looking at the data this group was deemed insufficient for analysis)
+* Census tract average household size
+* Census tract median household income
+
+
+$$\text{Interaction Model : } Savings = \beta_0 + \beta_1X_1 + \beta_2X_2 + \beta_3X_1X_2 + \epsilon$$
+
+where 
+
+* $X_1$ is a binary variable for treatment status (received ESK)
+* $X_2$ is one of the site characteristics of interest
+* $e$ = residual error
+
+
+
+\pagebreak
+
+# Creating New Categorical Variables
+
+__For all study groups:__
+
+* InstallPeriod = categorical variable for period of installation where:
+    + InstallPeriod = 1 if InstalledYear is between 2013 to 2014
+    + InstallPeriod = 2 if InstalledYear is between 2015 to 2016
+    + InstallPeriod = 3 if InstalledYear is between 2017 to 2018
+* HomeSize = categorical variable for square footage where:
+    + HomeSize = 1 if SqFt < 1,200 
+    + HomeSize = 2 if SqFt is between 1,200 to 2,000
+    + HomeSize = 3 if SqFt is between 2,000 to 3,000
+    + HomeSize = 4 if SqFt > 3,000
+* Vintage = categorical variable for the year the site was built where:
+    + Vintage = 1 if YearBuilt < 1930
+    + Vintage = 2 if YearBuilt is between 1930 to 1960 
+    + Vintage = 3 if YearBuilt is between 1960 to 1990
+    + Vintage = 4 if YearBuilt > 1990 
+* GasUse = categorical values of annual gas use (therms) in baseline period where:
+    + GasUse = 1 if baseline_predicted_usage =< 490 
+    + GasUse = 2 if baseline_predicted_usage between 490 to 640
+    + GasUse = 3 if baseline_predicted_usage between 640 to 810
+    + GasUse = 4 if baseline_predicted_usage => 810 
+* Region = categorical value for region where:
+    + RegionCategory = 1 for “Central Oregon” or “Eastern Oregon” 
+    + RegionCategory = 2 for “Southern Oregon” or “North Coast” 
+    + RegionCategory = 3 for  “Portland Metro & Hood River” 
+    + RegionCategory = 4 for “Willamette Valley” 
+    + RegionCategory = 5 for “Southwest Washington” 
+* Income = Categorical value for Income where:
+    + Income = 1 if Median household income in the past 12 months is in the first quintile 
+    + Income = 2 if Median household income in the past 12 months is in the second quintile
+    + Income = 3 if Median household income in the past 12 months is in the third quintile 
+    + Income = 4 if Median household income in the past 12 months is in the fourth quintile 
+    + Income = 5 if Median household income in the past 12 months is in the fifth quintile 
+* HouseholdSize = Categorical value for household size where:
+    + HouseholdSize = 1 if Average household size is in the first quintile 
+    + HouseholdSize = 2 if Average household size is in the second quintile
+    + HouseholdSize = 3 if Average household size is in the third quintile 
+    + HouseholdSize = 4 if Average household size is in the fourth quintile 
+    + HouseholdSize = 5 if Average household size is in the fifth quintile 
+
+__New Dummy Variables (Basline for the Analysis):__
+
+* ShowerTotalQty = ShowerHeadQty + ShowerheadWandQty
+* RecievedSH = dummy variable for whether a home recieved a showerhead and set to:
+    + 1 for homes that recieved a showerhead
+    + zero for all other homes
+* RecievedSW = dummy variable for whether a home recieved a shower wand and set to:
+    + 1 for homes that recieved a shower wand
+    + zero for all other homes
+  
+__Data QC__
+
+1. Check that all treated sites received at least 1 shower head or wand according to CRM
+2. Check for inconsistencies between CRM and Recurve for fuel classification: 
+    * Create flags for sites that indicated fuel as not GAS in CRM and not likely gas according to Recurve. While these might be appropriate to remove in future analyses, for this report we assume the Recurve classification is accurate.
+    * Create flags for sites that indicated fuel as not GAS in CRM but likely gas according to Recurve (there were ~5600 sites). While these might be appropriate to remove in future analyses, for this report we assume the Recurve classification is accurate.
+3. Check the number of treated and comparison sites with missing site characteristics that are necessary for the interaction models (SqFt, YearBuilt, etc.) These will be dropped for their respective regression model.
+    * Create flags for sites with missing site characteristics
+    * Create a column which links all counterfactual sites to their treated site (by site ID) and create flags for missing info based on these counterfactual-treatment groups 
+      + If a treated site is dropped because of missing info, its counterfactuals can be dropped as well based on these groupings (e.g. where flag_treated_no_sqft==TRUE, or flag_treated_no_yearbuilt==TRUE. etc.)
+      + If all counterfactuals for a treated site have no characteristic information, the treated site can also be dropped based on these groupings  (e.g. where matched_no_sqft==5, or matched_no_yearbuilt==5, etc.)
+
+Through this Anlysis:
+
+* 104 cases of flag_not_gas==TRUE were found.
+* 5671 cases of flag_uncertain_gas==TRUE were found.
+* 9652 cases of flag_treated_no_sqft==TRUE were found.
+* 9704 cases of flag_treated_no_yearbuilt==TRUE were found.
+* 7 cases of flag_treated_no_region==TRUE were found.
+* 16334 cases where 5 matched comparison sites had no sqft were found.
+* 16425 cases where 5 matched site had not yearbuilt were found.
+* 18 cases where 5 matched site had no region info were found.
+
+For Each variables respective regression, these flagged cases will be filtered out.
+
+```{r,echo=FALSE, message=FALSE, warning=FALSE}
+
+# create flags for checks
+dataQC <- Analysisdata %>%
+  #select(-geometry) %>%
+  mutate(flag_treated_no_qty = ifelse(portfolio_type=="treatment" & 
+                                   ShowerHeadQty==0 & ShowerWandQty==0, TRUE, FALSE)) %>%
+  mutate(flag_not_gas = ifelse(waterheatingfuel!="GAS" & likely_gas_water_heating==FALSE,
+                               TRUE,FALSE),
+         flag_uncertain_gas = ifelse(waterheatingfuel!="GAS" & likely_gas_water_heating==TRUE,
+                                     TRUE,FALSE)) %>%
+  mutate(flag_no_sqft = ifelse(is.na(SqFt),TRUE,FALSE),
+         flag_no_yearbuilt = ifelse(is.na(YearBuilt), TRUE, FALSE),
+         flag_no_region = ifelse(is.na(Region),TRUE,FALSE),
+         flag_no_sitetype = ifelse(is.na(MarketSubType),TRUE,FALSE)) %>%
+  mutate(matched_treated_id = case_when(portfolio_type=="treatment" ~ site,
+                                        portfolio_type=="stratified_future_participants" ~ site,
+                                        portfolio_type=="individual_matched" ~ str_sub(project,40,75),
+                                        ))
+
+
+#get site ID of treated sites with no characteristic info of interest  
+treated_no_info <- dataQC %>%
+  select(matched_treated_id, portfolio_type, flag_no_sqft,
+         flag_no_yearbuilt, flag_no_region, flag_no_sitetype) %>%
+  filter(portfolio_type!="individual_matched") %>%
+  mutate(flag_treated_no_sqft = ifelse(flag_no_sqft==TRUE, TRUE, FALSE),
+         flag_treated_no_yearbuilt = ifelse(flag_no_yearbuilt==TRUE, TRUE, FALSE),
+         flag_treated_no_region = ifelse(flag_no_region==TRUE, TRUE, FALSE),
+         flag_treated_no_sitetype = ifelse(flag_no_sitetype==TRUE, TRUE, FALSE)
+        ) %>%
+  select(-portfolio_type,
+         -flag_no_sqft, -flag_no_yearbuilt, 
+         -flag_no_region, -flag_no_sitetype)
+
+#check for cases where all matched comparison site has no site characteristics
+matched_no_info <- dataQC %>%
+  select(matched_treated_id, portfolio_type, flag_no_sqft,
+         flag_no_yearbuilt, flag_no_region, flag_no_sitetype) %>%
+  filter(portfolio_type=="individual_matched") %>%
+  mutate(no_sqft = ifelse(flag_no_sqft==TRUE, 1, 0),
+         no_yearbuilt = ifelse(flag_no_yearbuilt==TRUE, 1, 0),
+         no_region = ifelse(flag_no_region==TRUE, 1, 0),
+         no_sitetype = ifelse(flag_no_sitetype==TRUE, 1, 0)) %>%
+  group_by(matched_treated_id) %>%
+  summarise(matched_no_sqft = sum(no_sqft),
+            matched_no_yearbuilt = sum(no_yearbuilt),
+            matched_no_region = sum(no_region),
+            matched_no_sitetype = sum(no_sitetype))
+  
+#join with dataQc 
+dataQC2 <- dataQC %>%
+  inner_join(treated_no_info, by="matched_treated_id") %>%
+  inner_join(matched_no_info, by="matched_treated_id")  %>%
+  distinct()
+
+#You can use these QC flags to filter the sample for analysis later
+
+
+```
+
+```{r,echo=FALSE, eval=TRUE}
+
+#check treated sites with no showerhead and wands
+#dataQC2 %>% tabyl(flag_treated_no_qty) # all FALSE, which is good
+
+#check fuel classification
+#dataQC2 %>% tabyl(flag_not_gas) 
+# 104 cases of flag_not_gas==TRUE
+#dataQC2 %>% tabyl(flag_uncertain_gas) 
+# 5671 cases of flag_uncertain_gas==TRUE
+
+#check treated sites with no site characteristics
+#dataQC2 %>% tabyl(flag_treated_no_sqft) 
+# 9652 cases of flag_treated_no_sqft==TRUE
+#dataQC2 %>% tabyl(flag_treated_no_yearbuilt) 
+#9704 cases of TRUE
+#dataQC2 %>% tabyl(flag_treated_no_region) 
+# 7 cases of TRUE
+#dataQC2 %>% tabyl(flag_treated_no_sitetype) 
+# 2258 cases of TRUE
+
+#check treated sites with no yearbuilt
+#dataQC2 %>% tabyl(matched_no_sqft) 
+# 16334 cases where 5 matched comparison sites had no sqft
+#dataQC2 %>% tabyl(matched_no_yearbuilt)  
+# 16425 cases where 5 matched site had not yearbuilt
+#dataQC2 %>% tabyl(matched_no_region)
+# 18 cases where 1 matched site had no region info
+#dataQC2 %>% tabyl(matched_no_sitetype)
+# 4817 cases where 5 matched site had no MarketSubType info
+
+Analysisdata <- dataQC2
+
+``` 
+  
+  
+  
+```{r, echo= FALSE}
+
+Analysisdata2 <- Analysisdata %>%
+  mutate(HomeSize = as.factor(case_when(
+    SqFt < 1200 ~ 1,
+    SqFt >=1200 & SqFt <= 2000 ~ 2,
+    SqFt >=2000 & SqFt <= 3000 ~ 3,
+    SqFt >3000 ~ 4
+  ))) %>%
+  mutate(HomeSize = factor(HomeSize,
+                           levels = c(1,2,3,4), 
+                           labels = c("<1200","1,200-2,000","2,000-3,000",">3,000"))) %>%
+  mutate(InstallPeriod = (case_when(
+    InstalledYear >= 2013 & InstalledYear <= 2014 ~ 1,
+    InstalledYear >= 2015 & InstalledYear <= 2016 ~ 2,
+    InstalledYear >= 2017 & InstalledYear <= 2018 ~ 3,
+  ))) %>%
+  mutate(InstallPeriod = factor(InstallPeriod,
+                levels = c(1,2,3),
+                labels = c("2013-2014","2015-2016","2017-2018"))) %>%
+  mutate(Vintage = case_when(
+        YearBuilt < 1930 ~ 1,
+        YearBuilt >= 1930 & YearBuilt <= 1960 ~ 2,
+        YearBuilt >= 1960 & YearBuilt <= 1990 ~ 3,
+        YearBuilt > 1990 ~ 4
+     )) %>%
+  mutate(Vintage = factor(Vintage, 
+                          levels = c(1,2,3,4),
+         labels = c("<1930","1930-1960","1960-1990",">1990"))) %>%
+  mutate(GasUse = case_when(
+    baseline_predicted_usage < 490 ~ 1,
+    baseline_predicted_usage >=490 & baseline_predicted_usage <= 640 ~ 2,
+    baseline_predicted_usage >=640 & baseline_predicted_usage <= 810 ~ 3,
+    baseline_predicted_usage >810 ~ 4
+  )) %>%
+  mutate(GasUse = factor(GasUse, 
+                         levels = c(1,2,3,4),
+                         labels = c("<490","490-640","640-810",">810"))) %>%
+  mutate(RegionCategory = as.factor(case_when(
+   Region == "Central Oregon" | Region == "Eastern Oregon" ~ 1,
+   Region == "Southern Oregon" | Region == "North Coast" ~ 2,
+   Region == "Portland Metro & Hood River" ~ 3,
+   Region == "Willamette Valley" ~ 4,
+   Region == "Southwest Washington" ~ 5
+  ))) %>%
+   mutate(SiteBuilt = (case_when(
+    MarketSubType == "Site Built Home" ~ 1,
+    MarketSubType == "Manufactured Home" ~ 0
+  ))) %>%
+  mutate(SiteBuilt = factor(SiteBuilt, 
+                            levels = c(1,0),
+                            labels = c("Site Built Home", "Manufactured Home")))  
+
+quintileIncome<- quantile(Analysisdata2$MedHHIncPast12M,
+                          probs=seq(0,1,.2), na.rm = TRUE)
+quintileIncome<- as.array(quintileIncome)
+
+Analysisdata2<- Analysisdata2%>%
+  mutate(Income = case_when(
+    MedHHIncPast12M <=quintileIncome[2] ~ "1",
+    MedHHIncPast12M>=quintileIncome[2] & MedHHIncPast12M<=quintileIncome[3] ~ "2",
+    MedHHIncPast12M >=quintileIncome[3] & MedHHIncPast12M <=quintileIncome[4] ~ "3",
+    MedHHIncPast12M>=quintileIncome[4] & MedHHIncPast12M<=quintileIncome[5] ~ "4",
+    MedHHIncPast12M>=quintileIncome[5] ~ "5"))
+
+quintileHousing<- quantile(Analysisdata2$AvgHHSize, probs=seq(0,1,.2), na.rm = TRUE)
+quintileHousing<- as.array(quintileHousing)
+
+Analysisdata2<- Analysisdata2%>%
+  mutate(HouseholdSize = case_when(
+    AvgHHSize<=quintileHousing[2] ~ "1",
+    AvgHHSize>=quintileHousing[2] & AvgHHSize<=quintileHousing[3] ~ "2",
+    AvgHHSize>=quintileHousing[3] & AvgHHSize<=quintileHousing[4] ~ "3",
+    AvgHHSize>=quintileHousing[4] & AvgHHSize<=quintileHousing[5] ~ "4",
+    AvgHHSize>=quintileHousing[5] ~ "5"))
+
+Analysisdata2<-Analysisdata2%>%
+  mutate(RecievedSW = case_when(
+    ShowerWandQty >= 1~1,
+    ShowerWandQty<1~0,
+    is.na(ShowerWandQty)~0
+  ))
+
+
+Analysisdata2<-Analysisdata2%>%
+  mutate(RecievedSH = case_when(
+    ShowerHeadQty >= 1~1,
+    ShowerHeadQty<1~0,
+    is.na(ShowerHeadQty)~0
+  ))
+
+
+```
+
+
+```{r, echo= FALSE}
+Analysisdata3 <- Analysisdata2%>%
+  mutate(matchedyear1 = str_sub(Analysisdata2$project, 40, 75 ))
+
+Duplicate<- Analysisdata2%>%
+  filter(portfolio_type=="treatment")
+
+Duplicate<- arrange(Duplicate, project_installed_date)
+
+RemoveTreatment<- Duplicate%>%
+  get_dupes(site)
+
+
+RemoveTreatment<- arrange(RemoveTreatment, desc(project_installed_date))
+RemoveTreatment<- distinct(RemoveTreatment, site, .keep_all = TRUE)
+RemoveTreatment<- RemoveTreatment%>%
+  mutate(IsDuplicateTreatment = 1)
+RemoveTreatment<- RemoveTreatment%>%
+  select(project, IsDuplicateTreatment)
+
+
+Analysisdata3<- left_join(Analysisdata3, RemoveTreatment, by = "project")
+
+
+RemoveMatched<- Duplicate%>%
+  get_dupes(site)
+
+
+RemoveMatched<- arrange(RemoveMatched, desc(project_installed_date))
+RemoveMatched<- distinct(RemoveMatched, site, .keep_all = TRUE)
+RemoveMatched<- RemoveMatched%>%
+  rename(matchedyear1 = site)%>%
+  mutate(IsDuplicateMatched=1)
+RemoveMatched<- RemoveMatched%>%
+  select(matchedyear1, IsDuplicateMatched)
+
+Analysisdata3<- left_join(Analysisdata3, RemoveMatched, by = "matchedyear1")
+
+Analysisdata3<- Analysisdata3%>%
+  filter(is.na(IsDuplicateTreatment))%>%
+  filter(is.na(IsDuplicateMatched))
+
+
+```
+In addition, there were 481 sites that were repeat participants for the treatment group. Because we assume that the replacing an efficient showerhead with another efficient showerhead will not lead to additional savings, the later year repeat participants must be removed, as well as their matched participant group. In doing so, 481 repeat participants were removed as well as 2878 matched homes.
+
+### Summary statistics of final dataset to be used in analysis 
+
+The following tables are based on the modeled_savings field
+
+```{r,echo=FALSE,message=FALSE,warning=FALSE}
+
+Analysisdata3%>%
+tabyl(portfolio_type) %>%
+  adorn_totals() %>%
+  adorn_pct_formatting(digits = 2) %>%
+  kable(format = "latex", booktabs = TRUE,
+        col.names = c("Site Type","n","Percent"),
+        caption = "Number of Sites in Each Study Group Within Final Analysis Sample",
+        format.args = list(big.mark= ",")) %>%
+  kable_styling(latex_options = "HOLD_position")
+
+
+ShowerHeadSavings <- Analysisdata3 %>%
+  group_by(portfolio_type,RecievedSH) %>%
+  summarise(N = n(),
+            avg_savings = mean(modeled_savings),
+            max_savings = max(modeled_savings),
+            min_savings = min(modeled_savings),
+            sum_savings = sum(modeled_savings),
+            sd_savings = sd(modeled_savings))
+
+kable(ShowerHeadSavings , format = "latex", booktabs = TRUE,
+        col.names = c("Group","InstalledSH","N","mean","max","min","sum","sd"),
+        caption = "Weather Normalized Savings (therms) By Whether Home Recieved SH",
+        format.args = list(big.mark= ","),
+        digits = 2) %>%
+  kable_styling(latex_options = c("HOLD_position","scale_down")) 
+
+ShowerWandSavings <- Analysisdata3 %>%
+  group_by(portfolio_type,RecievedSW) %>%
+  summarise(N = n(),
+            avg_savings = mean(modeled_savings),
+            max_savings = max(modeled_savings),
+            min_savings = min(modeled_savings),
+            sum_savings = sum(modeled_savings),
+            sd_savings = sd(modeled_savings))
+
+kable(ShowerWandSavings , format = "latex", booktabs = TRUE,
+        col.names = c("Group","InstalledSW","N","mean","max","min","sum","sd"),
+        caption = "Weather Normalized Savings (therms) By Whether Home Recieved SW",
+        format.args = list(big.mark= ","),
+        digits = 2) %>%
+  kable_styling(latex_options = c("HOLD_position","scale_down")) 
+
+
+
+```
+
+\pagebreak
+
+__Modeled Saving__
+
+```{r,echo=FALSE,message=FALSE,warning=FALSE}
+
+PeriodSavings <- Analysisdata3 %>%
+  group_by(portfolio_type,InstallPeriod) %>%
+  summarise(N = n(),
+            Mean = mean(modeled_savings),
+            Max = max(modeled_savings),
+            Min = min(modeled_savings),
+            Sum = sum(modeled_savings),
+            StdDev = sd(modeled_savings))
+
+  kable(PeriodSavings, format = "latex", booktabs = TRUE,
+        caption = "Weather Normalized Savings (therms) By Install Period and Group",
+        format.args = list(big.mark= ","),
+        digits = 2) %>%
+  kable_styling(latex_options = c("HOLD_position","scale_down"))
+
+
+```
+
+
+
+```{r, echo=FALSE, message=FALSE,warning=FALSE}
+
+SavingsHomeSize <- Analysisdata3 %>%
+  group_by(portfolio_type,HomeSize) %>%
+  summarise(N = n(),
+            Mean = mean(modeled_savings),
+            Max = max(modeled_savings),
+            Min = min(modeled_savings),
+            Sum = sum(modeled_savings),
+            StdDev = sd(modeled_savings))
+
+
+kable(SavingsHomeSize, format = "latex", booktabs = TRUE,
+        caption = "Weather Normalized Savings (therms) By HomeSize and Group",
+        format.args = list(big.mark= ","),
+        digits = 2) %>%
+  kable_styling(latex_options = c("HOLD_position","scale_down"))
+
+```
+
+```{r,echo=FALSE,message=FALSE,warning=FALSE}
+
+VintageSavings <- Analysisdata3 %>%
+  #filter(portfolio_type == "individual_matched") %>%
+  group_by(portfolio_type,Vintage) %>%
+  summarise(N = n(),
+            avg_savings = mean(modeled_savings),
+            max_savings = max(modeled_savings),
+            min_savings = min(modeled_savings),
+            sum_savings = sum(modeled_savings),
+            sd_savings = sd(modeled_savings))
+
+kable(VintageSavings, format = "latex", booktabs = TRUE,
+        col.names = c("Group","Vintage","N","mean","max","min","sum","sd"),
+        caption = "Weather Normalized Savings (therms) By House Vintage and Group",
+        format.args = list(big.mark= ","),
+        digits = 2) %>%
+  kable_styling(latex_options = c("HOLD_position","scale_down")) 
+
+```
+
+
+
+```{r,echo=FALSE,message=FALSE,warning=FALSE}
+
+GasGroupSavings <- Analysisdata3 %>%
+  group_by(portfolio_type,GasUse) %>%
+  summarise(N = n(),
+            avg_savings = mean(modeled_savings),
+            max_savings = max(modeled_savings),
+            min_savings = min(modeled_savings),
+            sum_savings = sum(modeled_savings),
+            sd_savings = sd(modeled_savings))
+
+kable(GasGroupSavings, format = "latex", booktabs = TRUE,
+        col.names = c("Group","Vintage","N","mean","max","min","sum","sd"),
+        caption = "Weather Normalized Savings (therms) By Baseline Gas Use and Group",
+        format.args = list(big.mark= ","),
+        digits = 2) %>%
+  kable_styling(latex_options = c("HOLD_position","scale_down")) 
+
+```
+
+
+
+```{r,echo=FALSE,message=FALSE,warning=FALSE}
+
+RegionSavings <- Analysisdata3 %>%
+  group_by(portfolio_type,RegionCategory) %>%
+  summarise(N = n(),
+            avg_savings = mean(modeled_savings),
+            max_savings = max(modeled_savings),
+            min_savings = min(modeled_savings),
+            sum_savings = sum(modeled_savings),
+            sd_savings = sd(modeled_savings))
+
+kable(RegionSavings, format = "latex", booktabs = TRUE,
+        col.names = c("Group","Region","N","mean","max","min","sum","sd"),
+        caption = "Weather Normalized Savings (therms) By Region and Group",
+        format.args = list(big.mark= ","),
+        digits = 2) %>%
+  kable_styling(latex_options = c("HOLD_position","scale_down")) 
+
+```
+
+
+```{r,echo=FALSE,message=FALSE,warning=FALSE}
+
+IncomeSavings <- Analysisdata3 %>%
+  group_by(portfolio_type,Income) %>%
+  summarise(N = n(),
+            avg_savings = mean(modeled_savings),
+            max_savings = max(modeled_savings),
+            min_savings = min(modeled_savings),
+            sum_savings = sum(modeled_savings),
+            sd_savings = sd(modeled_savings))
+
+kable(IncomeSavings, format = "latex", booktabs = TRUE,
+        col.names = c("Group","Income","N","mean","max","min","sum","sd"),
+        caption = "Weather Normalized Savings (therms) By Income and Group",
+        format.args = list(big.mark= ","),
+        digits = 2) %>%
+  kable_styling(latex_options = c("HOLD_position","scale_down")) 
+
+```
+
+
+```{r,echo=FALSE,message=FALSE,warning=FALSE}
+
+HouseholdSavings <- Analysisdata3 %>%
+  group_by(portfolio_type,HouseholdSize) %>%
+  summarise(N = n(),
+            avg_savings = mean(modeled_savings),
+            max_savings = max(modeled_savings),
+            min_savings = min(modeled_savings),
+            sum_savings = sum(modeled_savings),
+            sd_savings = sd(modeled_savings))
+
+kable(HouseholdSavings, format = "latex", booktabs = TRUE,
+        col.names = c("Group","HouseholdSize","N","mean","max","min","sum","sd"),
+        caption = "Weather Normalized Savings (therms) By Household Size and Group",
+        format.args = list(big.mark= ","),
+        digits = 2) %>%
+  kable_styling(latex_options = c("HOLD_position","scale_down")) 
+
+```
+
+
+\pagebreak
+
+# Regression Results
+
+
+
+## Overall Results
+
+$$\widehat{Savings}= \hat{\beta_0} + \hat{\beta_1}X_1 + \hat{\beta_2}X_2 + \epsilon$$
+
+
+__For the both groups comparison group:__
+
+* $Savings$ = modeled_savings
+* $X_1$ = RecievedSH, which is a dummy variable representing homes which recieved showerheads and is set to zero for the comparison homes
+* $X_2$ = RecievedSW, which is a dummy variable representing homes which recieved shower wands and is set to zero for the comparison homes
+* $e$ = residual error
+
+```{r,echo= FALSE, message=FALSE, warning=FALSE}
+
+#Analysis using matched comparison group
+RegDataset <- Analysisdata3 %>%
+  filter(portfolio_type!="stratified_future_participants")
+reg1 <- lm(modeled_savings ~ RecievedSH + RecievedSW, 
+           data = RegDataset)
+
+#Analysis using future participant group
+RegDataset2 <- Analysisdata3 %>%
+  filter(portfolio_type!="individual_matched")
+reg2 <- lm(modeled_savings ~ RecievedSH + RecievedSW, 
+           data = RegDataset2)
+  
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='asis'}
+stargazer(reg1, reg2, 
+          title = "Overall Regression Results for Matched Control and Future Participant Comparison Groups",
+          type = "latex",
+          column.labels = c("Matched Comparison Group","Stratified Future Participants"),
+          ci = TRUE,
+          ci.level = 0.90,
+          single.row = TRUE,
+          header = FALSE)
+```
+
+
+The values in the bracket represent the 90% confidence interval levels
+
+The regression results indicate that there is no reduction in consumption for households receiving a showerhead. The installation of a shower wand is associated with an additional 18 to 19 therm reduction.  It is worth noting that the majority of shower wands were installed in the 2017-2018 installation period.
+
+Using this specification we interact these dummy variables with further variables to determine if geography, installation period, building square footage , or level of gas consumption might help explain the results. In particular, the lack of savings for homes that received showerheads.
+
+\pagebreak
+
+## Results by Installation Period
+```{r, message=FALSE, warning=FALSE,echo=FALSE,eval=TRUE}
+
+#Analysis using matched comparison group
+RegDataset <- Analysisdata3 %>%
+  filter(portfolio_type!="stratified_future_participants")
+reg5 <- lm(modeled_savings ~ RecievedSH + RecievedSW + 
+             RecievedSH*InstallPeriod + RecievedSW*InstallPeriod, 
+           data = RegDataset)
+
+#Analysis using future participant group
+RegDataset2 <- Analysisdata3 %>%
+  filter(portfolio_type!="individual_matched")
+reg6 <- lm(modeled_savings ~ RecievedSH + RecievedSW + 
+             RecievedSH*InstallPeriod + RecievedSW*InstallPeriod, 
+           data = RegDataset2)
+  
+
+#RegDataset2 %>% tabyl(InstallPeriod)
+#Check why InstallPeriod containst all NA
+
+
+```
+
+```{r, eval=TRUE,echo=FALSE, message=FALSE, warning=FALSE, results='asis'}
+stargazer(reg5, reg6, 
+          title = "Results By Install Period for Matched Control and Future Participant Comparison Groups",
+          type = "latex",
+          ci = TRUE,
+          ci.level = 0.90,
+          single.row = TRUE,
+          header = FALSE)
+```
+
+
+```{r, eval=TRUE,echo=FALSE, message=FALSE, warning=FALSE, results='asis'}
+RegSummary<- as.vector(tidy(reg5))
+RecievedSHMatched1<- as.numeric(RegSummary[2,2])
+RecievedSHMatched2<- as.numeric(RegSummary[6,2]+RegSummary[2,2])
+RecievedSHMatched3<- as.numeric(RegSummary[7,2]+RegSummary[2,2])
+RecievedSWMatched1<-as.numeric(RegSummary[3,2])
+RecievedSWMatched2<-as.numeric(RegSummary[8,2]+RegSummary[3,2])
+RecievedSWMatched3<- as.numeric(RegSummary[9,2]+RegSummary[3,2])  
+
+RegSummary1<- as.vector(tidy(reg6))
+RecievedSHFuture1<- as.numeric(RegSummary1[2,2])
+RecievedSHFuture2<- as.numeric(RegSummary1[6,2]+RegSummary1[2,2])
+RecievedSHFuture3<- as.numeric(RegSummary1[7,2]+RegSummary1[2,2])
+RecievedSWFuture1<-as.numeric(RegSummary1[3,2])
+RecievedSWFuture2<- as.numeric(RegSummary1[8,2]+RegSummary1[3,2])
+RecievedSWFuture3<- as.numeric(RegSummary1[9,2]+RegSummary1[3,2]) 
+
+
+
+SimplifiedResults <- matrix(c(RecievedSHMatched1,RecievedSHMatched2
+                              ,RecievedSHMatched3,RecievedSWMatched1, RecievedSWMatched2, RecievedSWMatched3,
+                              RecievedSHFuture1,RecievedSHFuture2
+                              ,RecievedSHFuture3,RecievedSWFuture1,
+                              RecievedSWFuture2,RecievedSWFuture3),nrow=6,)
+rownames(SimplifiedResults) <- c("RecievedSH_2013_2014","RecievedSH_2015_2016","RecievedSH_2017_2018",
+                                 "RecievedSW_2013_2014","RecievedSW_2015_2016", "RecievedSW_2017_2018" )
+colnames(SimplifiedResults) <- c("Individual Matched","tratified Future Participants")
+
+
+
+kable(SimplifiedResults, format = "latex", booktabs = TRUE,
+        caption = "Simplified Results by Install Period for Matched Control and Future Participant Comparison Groups ",
+        format.args = list(big.mark= ","),
+        digits = 2) %>%
+  kable_styling(font_size = 11, latex_options = c("HOLD_position")) 
+```
+
+The regression estimating showerhead, aerator and shower wand savings by period installed indicates that savings for showerheads are more pronounced in the most recent time period, 2017-2018.The savings for a showerhead was estimated to range between 4-11 therms.  Shower wands were estimated to add an additional 7-11 therm savings in the 2017-2018 program years.  The negative coefficients estimated for shower wands in 2016-2016 might be due to the few households receiving shower wands in these programs years.
+\pagebreak
+
+
+## Results by Home Size
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='asis'}
+#Analysis using matched comparison group
+RegDataset <- Analysisdata3 %>%
+  filter(portfolio_type!="stratified_future_participants")%>%
+  filter(SqFt>=400 & SqFt<=10000)%>%
+  filter(matched_no_sqft<5)%>%
+  filter(flag_treated_no_sqft!="TRUE")%>%
+  filter(!is.na(SqFt))
+reg7 <-lm(modeled_savings ~ RecievedSH + RecievedSW + 
+             RecievedSH*HomeSize + RecievedSW*HomeSize,  
+           data = RegDataset)
+
+#Analysis using future participant group
+RegDataset2 <- Analysisdata3 %>%
+  filter(portfolio_type!="individual_matched")%>%
+  filter(!is.na(SqFt)) %>%
+  filter(SqFt>=400 & SqFt<=10000)%>%
+  filter(matched_no_sqft!=5)%>%
+  filter(flag_treated_no_sqft!="TRUE")
+reg8 <- lm(modeled_savings~ RecievedSH + RecievedSW + 
+             RecievedSH*HomeSize + RecievedSW*HomeSize, 
+           data=RegDataset2)
+
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='asis'}
+stargazer(reg7, reg8, 
+          title = "Results By Home Size for Matched Control and Future Participant Comparison Groups",
+          type = "latex",
+          ci = TRUE,
+          ci.level = 0.90,
+          single.row = TRUE,
+          header = FALSE)
+```
+
+```{r, eval=TRUE,echo=FALSE, message=FALSE, warning=FALSE, results='asis'}
+#Homesize
+RegSummary<- as.vector(tidy(reg7))
+#RegSummary
+RecievedSHMatched1<- as.numeric(RegSummary[2,2])
+RecievedSHMatched2<-as.numeric(RegSummary[7,2]+RegSummary[2,2])
+RecievedSHMatched3<- as.numeric(RegSummary[8,2]+RegSummary[2,2])
+RecievedSHMatched4<- as.numeric(RegSummary[9,2]+RegSummary[2,2])
+RecievedSWMatched1<- as.numeric(RegSummary[3,2])
+RecievedSWMatched2<-as.numeric(RegSummary[10,2]+RegSummary[3,2])
+RecievedSWMatched3<- as.numeric(RegSummary[11,2]+RegSummary[3,2])
+RecievedSWMatched4<- as.numeric(RegSummary[12,2]+RegSummary[3,2])
+
+RegSummary1<- as.vector(tidy(reg8))
+RecievedSHFuture1<- as.numeric(RegSummary1[2,2])
+RecievedSHFuture2<-as.numeric(RegSummary1[7,2]+RegSummary1[2,2])
+RecievedSHFuture3<- as.numeric(RegSummary1[8,2]+RegSummary1[2,2])
+RecievedSHFuture4<- as.numeric(RegSummary1[9,2]+RegSummary1[2,2])
+RecievedSWFuture1<- as.numeric(RegSummary1[3,2])
+RecievedSWFuture2<-as.numeric(RegSummary1[10,2]+RegSummary1[3,2])
+RecievedSWFuture3<- as.numeric(RegSummary1[11,2]+RegSummary1[3,2])
+RecievedSWFuture4<- as.numeric(RegSummary1[12,2]+RegSummary1[3,2])
+
+SimplifiedResults <- matrix(c(RecievedSHMatched1,RecievedSHMatched2,
+                              RecievedSHMatched3,RecievedSHMatched4,RecievedSWMatched1,
+                              RecievedSWMatched2, RecievedSWMatched3,RecievedSWMatched4,
+                              RecievedSHFuture1,RecievedSHFuture2,
+                              RecievedSHFuture3,RecievedSHFuture4,RecievedSWFuture1,
+                              RecievedSWFuture2,RecievedSWFuture3, RecievedSWFuture4),nrow=8)
+rownames(SimplifiedResults) <- c("RecievedSH:HomeSize400-1200","RecievedSH:HomeSize1,200-2,000",
+                                 "RecievedSH:HomeSize2,000-3,000", "RecievedSH:HomeSize>3,000" ,
+                                 "RecievedSW:HomeSize400-1200","RecievedSW:HomeSize1,200-2,000",
+                                 "RecievedSW:HomeSize2,000-3,000", "RecievedSW:HomeSize>3,000")
+colnames(SimplifiedResults) <- c("Individual Matched","Stratified Future Participants")
+
+SimplifiedResultstable<- as.table(SimplifiedResults)
+
+
+kable(SimplifiedResults, format = "latex", booktabs = TRUE,
+        caption = "Simplified Results by Home Size for Matched Control and Future Participant Comparison Groups ",
+        format.args = list(big.mark= ","),
+        digits = 2) %>%
+  kable_styling(font_size = 11, latex_options = c("HOLD_position")) 
+```
+
+The regression estimating showerhead, aerator, and shower wand savings by building square footage indicates that the smaller homes were associated with higher savings. Those savings were most pronounced in smaller buildings (400-1200) sqft, where the savings were estimated at 29 therms for shower wands and 2 therms for showerheads. Both showerheads and shower wands saw the lowest savings in homes larger than 3000 feet.  Overall, it looks like there are more savings associated with shower wands across the board.
+
+\pagebreak
+
+
+## Results by House Vintage
+
+
+```{r,echo=FALSE, message=FALSE, warning=FALSE}
+
+#Analysis using matched comparison group
+RegDataset <- Analysisdata3 %>%
+  filter(portfolio_type!="stratified_future_participants")%>%
+  filter(!is.na(Vintage))%>%
+  filter(matched_no_yearbuilt!=5)%>%
+  filter(flag_treated_no_yearbuilt!="TRUE")
+reg11 <- lm(modeled_savings ~ RecievedSH + RecievedSW + 
+             RecievedSH*Vintage + RecievedSW*Vintage,  
+            data = RegDataset)
+
+#Analysis using future participant group
+RegDataset2 <- Analysisdata3 %>%
+  filter(portfolio_type!="individual_matched")%>%
+  filter(!is.na(Vintage))%>%
+  filter(matched_no_yearbuilt!=5)%>%
+  filter(flag_treated_no_yearbuilt!="TRUE")
+reg12 <- lm(modeled_savings ~RecievedSH + RecievedSW + 
+             RecievedSH*Vintage + RecievedSW*Vintage, 
+            data=RegDataset2)
+  
+
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='asis'}
+stargazer(reg11, reg12, 
+          title = "Results By House Vintage for Matched Control and Future Participant Comparison Groups",
+          type = "latex",
+          single.row = TRUE,
+          ci = TRUE,
+          ci.level = 0.90,
+          header = FALSE)
+```
+
+```{r, eval=TRUE,echo=FALSE, message=FALSE, warning=FALSE, results='asis'}
+#Vintage
+RegSummary<- as.vector(tidy(reg11))
+RecievedSHMatched1<- as.numeric(RegSummary[2,2])
+RecievedSHMatched2<-as.numeric(RegSummary[7,2]+RegSummary[2,2])
+RecievedSHMatched3<- as.numeric(RegSummary[8,2]+RegSummary[2,2])
+RecievedSHMatched4<- as.numeric(RegSummary[9,2]+RegSummary[2,2])
+RecievedSWMatched1<- as.numeric(RegSummary[3,2])
+RecievedSWMatched2<-as.numeric(RegSummary[10,2]+RegSummary[3,2])
+RecievedSWMatched3<- as.numeric(RegSummary[11,2]+RegSummary[3,2])
+RecievedSWMatched4<- as.numeric(RegSummary[12,2]+RegSummary[3,2])
+
+RegSummary1<- as.vector(tidy(reg12))
+RecievedSHFuture1<- as.numeric(RegSummary1[2,2])
+RecievedSHFuture2<-as.numeric(RegSummary1[7,2]+RegSummary1[2,2])
+RecievedSHFuture3<- as.numeric(RegSummary1[8,2]+RegSummary1[2,2])
+RecievedSHFuture4<- as.numeric(RegSummary1[9,2]+RegSummary1[2,2])
+RecievedSWFuture1<- as.numeric(RegSummary1[3,2])
+RecievedSWFuture2<-as.numeric(RegSummary1[10,2]+RegSummary1[3,2])
+RecievedSWFuture3<- as.numeric(RegSummary1[11,2]+RegSummary1[3,2])
+RecievedSWFuture4<- as.numeric(RegSummary1[12,2]+RegSummary1[3,2])
+
+SimplifiedResults <- matrix(c(RecievedSHMatched1,RecievedSHMatched2,
+                              RecievedSHMatched3,RecievedSHMatched4,RecievedSWMatched1,
+                              RecievedSWMatched2, RecievedSWMatched3,RecievedSWMatched4,
+                              RecievedSHFuture1,RecievedSHFuture2,
+                              RecievedSHFuture3,RecievedSHFuture4,RecievedSWFuture1,
+                              RecievedSWFuture2,RecievedSWFuture3, RecievedSWFuture4),nrow=8)
+rownames(SimplifiedResults) <- c("RecievedSH:Vintage<1930","RecievedSH:Vintage1930-1960",
+                                 "RecievedSH:Vintage1960-1990", "RecievedSH:Vintage>1990" ,
+                                 "RecievedSW:Vintage<1930","RecievedSW:Vintage1930-1960",
+                                 "RecievedSW:Vintage1960-1990", "RecievedSW:Vintage>1990")
+colnames(SimplifiedResults) <- c("Individual Matched","Stratified Future Participants")
+
+SimplifiedResultstable<- as.table(SimplifiedResults)
+
+
+kable(SimplifiedResults, format = "latex", booktabs = TRUE,
+        caption = "Simplified Results by Vintage for Matched Control and Future Participant Comparison Groups ",
+        format.args = list(big.mark= ","),
+        digits = 2) %>%
+  kable_styling(font_size = 11, latex_options = c("HOLD_position")) 
+```
+
+The regression estimating showerhead, aerator, and shower wand savings by house vintage shows the trend that savings for shower wands installed increase as the house gets newer.
+\pagebreak
+
+
+## Results by Gas Use
+
+
+```{r,echo=FALSE, message=FALSE, warning=FALSE}
+
+#Analysis using matched comparison group
+RegDataset <- Analysisdata3 %>%
+  filter(portfolio_type!="stratified_future_participants")
+reg13 <- lm(modeled_savings ~RecievedSH + RecievedSW + 
+             RecievedSH*GasUse + RecievedSW*GasUse, 
+            data = RegDataset)
+
+#Analysis using future participant group
+RegDataset2 <- Analysisdata3 %>%
+  filter(portfolio_type!="individual_matched")
+reg14 <- lm(modeled_savings ~ RecievedSH + RecievedSW + 
+             RecievedSH*GasUse + RecievedSW*GasUse,  
+            data=RegDataset2)
+  
+
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='asis'}
+stargazer(reg13, reg14, 
+          title = "Results By House Gas Use for Matched Control and Future Participant Comparison Groups",
+          type = "latex",
+          single.row = TRUE,
+          ci = TRUE,
+          ci.level = 0.90,
+          header = FALSE)
+```
+
+```{r, eval=TRUE,echo=FALSE, message=FALSE, warning=FALSE, results='asis'}
+#GasUse
+RegSummary<- as.vector(tidy(reg13))
+RecievedSHMatched1<- as.numeric(RegSummary[2,2])
+RecievedSHMatched2<-as.numeric(RegSummary[7,2]+RegSummary[2,2])
+RecievedSHMatched3<- as.numeric(RegSummary[8,2]+RegSummary[2,2])
+RecievedSHMatched4<- as.numeric(RegSummary[9,2]+RegSummary[2,2])
+RecievedSWMatched1<- as.numeric(RegSummary[3,2])
+RecievedSWMatched2<-as.numeric(RegSummary[10,2]+RegSummary[3,2])
+RecievedSWMatched3<- as.numeric(RegSummary[11,2]+RegSummary[3,2])
+RecievedSWMatched4<- as.numeric(RegSummary[12,2]+RegSummary[3,2])
+
+RegSummary1<- as.vector(tidy(reg14))
+RecievedSHFuture1<- as.numeric(RegSummary1[2,2])
+RecievedSHFuture2<-as.numeric(RegSummary1[7,2]+RegSummary1[2,2])
+RecievedSHFuture3<- as.numeric(RegSummary1[8,2]+RegSummary1[2,2])
+RecievedSHFuture4<- as.numeric(RegSummary1[9,2]+RegSummary1[2,2])
+RecievedSWFuture1<- as.numeric(RegSummary1[3,2])
+RecievedSWFuture2<-as.numeric(RegSummary1[10,2]+RegSummary1[3,2])
+RecievedSWFuture3<- as.numeric(RegSummary1[11,2]+RegSummary1[3,2])
+RecievedSWFuture4<- as.numeric(RegSummary1[12,2]+RegSummary1[3,2])
+
+SimplifiedResults <- matrix(c(RecievedSHMatched1,RecievedSHMatched2,
+                              RecievedSHMatched3,RecievedSHMatched4,RecievedSWMatched1,
+                              RecievedSWMatched2, RecievedSWMatched3,RecievedSWMatched4,
+                              RecievedSHFuture1,RecievedSHFuture2,
+                              RecievedSHFuture3,RecievedSHFuture4,RecievedSWFuture1,
+                              RecievedSWFuture2,RecievedSWFuture3, RecievedSWFuture4),nrow=8)
+rownames(SimplifiedResults) <- c("RecievedSH:GasUse<=490","RecievedSH:GasUse490-640",
+                                 "RecievedSH:GasUse640-810", "RecievedSH:GasUse>810" ,
+                                 "RecievedSWGasUse<=490","RecievedSW:GasUse490-640",
+                                 "RecievedSW:GasUse640-810", "RecievedSW:GasUse>810")
+colnames(SimplifiedResults) <- c("Individual Matched","Stratified Future Participants")
+
+SimplifiedResultstable<- as.table(SimplifiedResults)
+
+
+kable(SimplifiedResults, format = "latex", booktabs = TRUE,
+        caption = "Simplified Results by Gas Use for Matched Control and Future Participant Comparison Groups ",
+        format.args = list(big.mark= ","),
+        digits = 2) %>%
+  kable_styling(font_size =11, latex_options = c("HOLD_position")) 
+```
+
+The regression estimating showerhead aerator and shower wand savings by gas use indicates that savings for participants are related to gas use. For showerheads it appears savings increase as gas use rises. It is important to note that this trend is only apparent for the matched participants regression. This could be because of the smaller sample size of future participants. Shower wands consistanly had positive savings across all gas usage, with the highest savings being at the highest gas usage.
+\pagebreak
+
+
+
+## Results by Region
+
+```{r,echo=FALSE, message=FALSE, warning=FALSE}
+
+#Analysis using matched comparison group
+RegDataset <- Analysisdata3 %>%
+  filter(portfolio_type!="stratified_future_participants")%>%
+  filter(!is.na(RegionCategory))%>%
+  filter(matched_no_region!=5)%>%
+  filter(flag_treated_no_region!="TRUE")
+reg15 <- lm(modeled_savings ~ RecievedSH + RecievedSW + 
+             RecievedSH*RegionCategory + RecievedSW*RegionCategory,  
+            data = RegDataset)
+
+#Analysis using future participant group
+RegDataset2 <- Analysisdata3 %>%
+  filter(portfolio_type!="individual_matched")%>%
+  filter(!is.na(RegionCategory))%>%
+  filter(matched_no_region!=5)%>%
+  filter(flag_treated_no_region!="TRUE")
+reg16 <- lm(modeled_savings ~  RecievedSH + RecievedSW + 
+             RecievedSH*RegionCategory + RecievedSW*RegionCategory,
+            data=RegDataset2)
+  
+
+```
+
+* Region = categorical value for region where:
+    + RegionCategory = 1 for “Central Oregon” or “Eastern Oregon” 
+    + RegionCategory = 2 for “Southern Oregon” or “North Coast” 
+    + RegionCategory = 3 for  “Portland Metro & Hood River” 
+    + RegionCategory = 4 for “Willamette Valley” 
+    + RegionCategory = 5 for “Southwest Washington”
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='asis'}
+stargazer(reg15, reg16, 
+          title = "Results By Region for Matched Control and Future Participant Comparison Groups",
+          type = "latex",
+          single.row = TRUE,
+          ci = TRUE,
+          ci.level = 0.90,
+          header = FALSE)
+```
+
+```{r, eval=TRUE,echo=FALSE, message=FALSE, warning=FALSE, results='asis'}
+#Region
+RegSummary<- as.vector(tidy(reg15))
+RecievedSHMatched1<- as.numeric(RegSummary[2,2])
+RecievedSHMatched2<-as.numeric(RegSummary[8,2]+RegSummary[2,2])
+RecievedSHMatched3<- as.numeric(RegSummary[9,2]+RegSummary[2,2])
+RecievedSHMatched4<- as.numeric(RegSummary[10,2]+RegSummary[2,2])
+RecievedSHMatched5<- as.numeric(RegSummary[11,2]+RegSummary[2,2])
+RecievedSWMatched1<- as.numeric(RegSummary[3,2])
+RecievedSWMatched2<-as.numeric(RegSummary[12,2]+RegSummary[3,2])
+RecievedSWMatched3<- as.numeric(RegSummary[13,2]+RegSummary[3,2])
+RecievedSWMatched4<- as.numeric(RegSummary[14,2]+RegSummary[3,2])
+RecievedSWMatched5<- as.numeric(RegSummary[15,2]+RegSummary[3,2])
+
+
+
+RegSummary1<- as.vector(tidy(reg16))
+RecievedSHFuture1<- as.numeric(RegSummary1[2,2])
+RecievedSHFuture2<-as.numeric(RegSummary1[8,2]+RegSummary1[2,2])
+RecievedSHFuture3<- as.numeric(RegSummary1[9,2]+RegSummary1[2,2])
+RecievedSHFuture4<- as.numeric(RegSummary1[10,2]+RegSummary1[2,2])
+RecievedSHFuture5<- as.numeric(RegSummary1[11,2]+RegSummary1[2,2])
+RecievedSWFuture1<- as.numeric(RegSummary1[3,2])
+RecievedSWFuture2<-as.numeric(RegSummary1[12,2]+RegSummary1[3,2])
+RecievedSWFuture3<- as.numeric(RegSummary1[13,2]+RegSummary1[3,2])
+RecievedSWFuture4<- as.numeric(RegSummary1[14,2]+RegSummary1[3,2])
+RecievedSWFuture5<- as.numeric(RegSummary1[15,2]+RegSummary1[3,2])
+
+SimplifiedResults <- matrix(c(RecievedSHMatched1,RecievedSHMatched2,
+                              RecievedSHMatched3,RecievedSHMatched4,RecievedSHMatched5, 
+                              RecievedSWMatched1, RecievedSWMatched2, RecievedSWMatched3,RecievedSWMatched4,
+                              RecievedSWMatched5, RecievedSHFuture1, RecievedSHFuture2,
+                              RecievedSHFuture3,RecievedSHFuture4,RecievedSHFuture5,
+                              RecievedSWFuture1,RecievedSWFuture2,RecievedSWFuture3,
+                              RecievedSWFuture4,RecievedSWFuture5 ),ncol=2,nrow = 10)
+rownames(SimplifiedResults) <- c("RecievedSH:RegionCategory1","RecievedSH:RegionCategory2",
+                                 "RecievedSH:RegionCategory3", "RecievedSH:RegionCategory4" ,
+                                 "RecievedSH:RegionCategory5","RecievedSW:RegionCategory1",
+                                 "RecievedSW:RegionCategory2", "RecievedSW:RegionCategory3",
+                                 "RecievedSW:RegionCategory4", "RecievedSW:RegionCategory5")
+colnames(SimplifiedResults) <- c("Individual Matched","Stratified Future Participants")
+
+SimplifiedResultstable<- as.table(SimplifiedResults)
+
+
+kable(SimplifiedResults, format = "latex", booktabs = TRUE,
+        caption = "Simplified Results by Region for Matched Control and Future Participant Comparison Groups ",
+        format.args = list(big.mark= ","),
+        digits = 2) %>%
+  kable_styling(font_size = 11, latex_options = c("HOLD_position")) 
+```
+The regression estimating showerhead aerator and shower wand savings by region indicates that showerheads see the most savings in region 5, Southwest Washington. The shower wand variable sees the most savings in region 1, Central or Eastern Oregon. 
+\pagebreak
+
+## Results by Income
+```{r,echo=FALSE, message=FALSE, warning=FALSE}
+
+#Analysis using matched comparison group
+RegDataset <- Analysisdata3 %>%
+  filter(portfolio_type!="stratified_future_participants")
+reg17 <- lm(modeled_savings ~  RecievedSH + RecievedSW + 
+             RecievedSH*Income + RecievedSW*Income, 
+            data = RegDataset)
+
+#Analysis using future participant group
+RegDataset2 <- Analysisdata3 %>%
+  filter(portfolio_type!="individual_matched")
+reg18 <- lm(modeled_savings ~  RecievedSH + RecievedSW + 
+             RecievedSH*Income + RecievedSW*Income,
+            data=RegDataset2)
+  
+
+```
+
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='asis'}
+stargazer(reg17, reg18, 
+          title = "Results By Income for Matched Control and Future Participant Comparison Groups",
+          type = "latex",
+          single.row = TRUE,
+          ci = TRUE,
+          ci.level = 0.90,
+          header = FALSE)
+```
+
+```{r, eval=TRUE,echo=FALSE, message=FALSE, warning=FALSE, results='asis'}
+#Income
+RegSummary<- as.vector(tidy(reg17))
+RecievedSHMatched1<- as.numeric(RegSummary[2,2])
+RecievedSHMatched2<-as.numeric(RegSummary[8,2]+RegSummary[2,2])
+RecievedSHMatched3<- as.numeric(RegSummary[9,2]+RegSummary[2,2])
+RecievedSHMatched4<- as.numeric(RegSummary[10,2]+RegSummary[2,2])
+RecievedSHMatched5<- as.numeric(RegSummary[11,2]+RegSummary[2,2])
+RecievedSWMatched1<- as.numeric(RegSummary[3,2])
+RecievedSWMatched2<-as.numeric(RegSummary[12,2]+RegSummary[3,2])
+RecievedSWMatched3<- as.numeric(RegSummary[13,2]+RegSummary[3,2])
+RecievedSWMatched4<- as.numeric(RegSummary[14,2]+RegSummary[3,2])
+RecievedSWMatched5<- as.numeric(RegSummary[15,2]+RegSummary[3,2])
+
+
+
+RegSummary1<- as.vector(tidy(reg18))
+RecievedSHFuture1<- as.numeric(RegSummary1[2,2])
+RecievedSHFuture2<-as.numeric(RegSummary1[8,2]+RegSummary1[2,2])
+RecievedSHFuture3<- as.numeric(RegSummary1[9,2]+RegSummary1[2,2])
+RecievedSHFuture4<- as.numeric(RegSummary1[10,2]+RegSummary1[2,2])
+RecievedSHFuture5<- as.numeric(RegSummary1[11,2]+RegSummary1[2,2])
+RecievedSWFuture1<- as.numeric(RegSummary1[3,2])
+RecievedSWFuture2<-as.numeric(RegSummary1[12,2]+RegSummary1[3,2])
+RecievedSWFuture3<- as.numeric(RegSummary1[13,2]+RegSummary1[3,2])
+RecievedSWFuture4<- as.numeric(RegSummary1[14,2]+RegSummary1[3,2])
+RecievedSWFuture5<- as.numeric(RegSummary1[15,2]+RegSummary1[3,2])
+
+SimplifiedResults <- matrix(c(RecievedSHMatched1,RecievedSHMatched2,
+                              RecievedSHMatched3,RecievedSHMatched4,RecievedSHMatched5, 
+                              RecievedSWMatched1, RecievedSWMatched2, RecievedSWMatched3,RecievedSWMatched4,
+                              RecievedSWMatched5, RecievedSHFuture1, RecievedSHFuture2,
+                              RecievedSHFuture3,RecievedSHFuture4,RecievedSHFuture5,
+                              RecievedSWFuture1,RecievedSWFuture2,RecievedSWFuture3,
+                              RecievedSWFuture4,RecievedSWFuture5 ),ncol=2,nrow = 10)
+rownames(SimplifiedResults) <- c("RecievedSH:Income1","RecievedSH:Income2",
+                                 "RecievedSH:Income3", "RecievedSH:Income4" ,
+                                 "RecievedSH:Income5","RecievedSW:Income1",
+                                 "RecievedSW:Income2", "RecievedSW:Income3",
+                                 "RecievedSW:Income4", "RecievedSW:Income5")
+colnames(SimplifiedResults) <- c("Individual Matched","Stratified Future Participants")
+
+SimplifiedResultstable<- as.table(SimplifiedResults)
+
+
+
+kable(SimplifiedResults, format = "latex", booktabs = TRUE,
+        caption = "Simplified Results by Income for Matched Control and Future Participant Comparison Groups ",
+        format.args = list(big.mark= ","),
+        digits = 2) %>%
+  kable_styling(font_size = 11, latex_options = c("HOLD_position")) 
+```
+
+There are no clear trends revealed when including income variables into the model.
+\pagebreak
+
+## Results by Household Size
+
+```{r,echo=FALSE, message=FALSE, warning=FALSE}
+
+#Analysis using matched comparison group
+RegDataset <- Analysisdata3 %>%
+  filter(portfolio_type!="stratified_future_participants")
+reg19 <- lm(modeled_savings ~  RecievedSH + RecievedSW + 
+             RecievedSH*HouseholdSize + RecievedSW*HouseholdSize, 
+            data = RegDataset)
+
+#Analysis using future participant group
+RegDataset2 <- Analysisdata3 %>%
+  filter(portfolio_type!="individual_matched")
+reg20 <- lm(modeled_savings ~ RecievedSH + RecievedSW + 
+             RecievedSH*HouseholdSize + RecievedSW*HouseholdSize,
+            data=RegDataset2)
+  
+
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='asis'}
+stargazer(reg19, reg20, 
+          title = "Results By Household Size for Matched Control and Future Participant Comparison Groups",
+          type = "latex",
+          single.row = TRUE,
+          ci = TRUE,
+          ci.level = 0.90,
+          header = FALSE)
+```
+
+```{r, eval=TRUE,echo=FALSE, message=FALSE, warning=FALSE, results='asis'}
+#HHSize
+RegSummary<- as.vector(tidy(reg19))
+RecievedSHMatched1<- as.numeric(RegSummary[2,2])
+RecievedSHMatched2<-as.numeric(RegSummary[8,2]+RegSummary[2,2])
+RecievedSHMatched3<- as.numeric(RegSummary[9,2]+RegSummary[2,2])
+RecievedSHMatched4<- as.numeric(RegSummary[10,2]+RegSummary[2,2])
+RecievedSHMatched5<- as.numeric(RegSummary[11,2]+RegSummary[2,2])
+RecievedSWMatched1<- as.numeric(RegSummary[3,2])
+RecievedSWMatched2<-as.numeric(RegSummary[12,2]+RegSummary[3,2])
+RecievedSWMatched3<- as.numeric(RegSummary[13,2]+RegSummary[3,2])
+RecievedSWMatched4<- as.numeric(RegSummary[14,2]+RegSummary[3,2])
+RecievedSWMatched5<- as.numeric(RegSummary[15,2]+RegSummary[3,2])
+
+
+
+RegSummary1<- as.vector(tidy(reg20))
+RecievedSHFuture1<- as.numeric(RegSummary1[2,2])
+RecievedSHFuture2<-as.numeric(RegSummary1[8,2]+RegSummary1[2,2])
+RecievedSHFuture3<- as.numeric(RegSummary1[9,2]+RegSummary1[2,2])
+RecievedSHFuture4<- as.numeric(RegSummary1[10,2]+RegSummary1[2,2])
+RecievedSHFuture5<- as.numeric(RegSummary1[11,2]+RegSummary1[2,2])
+RecievedSWFuture1<- as.numeric(RegSummary1[3,2])
+RecievedSWFuture2<-as.numeric(RegSummary1[12,2]+RegSummary1[3,2])
+RecievedSWFuture3<- as.numeric(RegSummary1[13,2]+RegSummary1[3,2])
+RecievedSWFuture4<- as.numeric(RegSummary1[14,2]+RegSummary1[3,2])
+RecievedSWFuture5<- as.numeric(RegSummary1[15,2]+RegSummary1[3,2])
+
+SimplifiedResults <- matrix(c(RecievedSHMatched1,RecievedSHMatched2,
+                              RecievedSHMatched3,RecievedSHMatched4,RecievedSHMatched5, 
+                              RecievedSWMatched1, RecievedSWMatched2, RecievedSWMatched3,RecievedSWMatched4,
+                              RecievedSWMatched5, RecievedSHFuture1, RecievedSHFuture2,
+                              RecievedSHFuture3,RecievedSHFuture4,RecievedSHFuture5,
+                              RecievedSWFuture1,RecievedSWFuture2,RecievedSWFuture3,
+                              RecievedSWFuture4,RecievedSWFuture5 ),ncol=2,nrow = 10)
+rownames(SimplifiedResults) <- c("RecievedSH:HouseholdSize1","RecievedSH:HouseholdSize2",
+                                 "RecievedSH:HouseholdSize3", "RecievedSH:HouseholdSize4" ,
+                                 "RecievedSH:HouseholdSize5","RecievedSW:HouseholdSize1",
+                                 "RecievedSW:HouseholdSize2", "RecievedSW:HouseholdSize3",
+                                 "RecievedSW:HouseholdSize4", "RecievedSW:HouseholdSize5")
+colnames(SimplifiedResults) <- c("Individual Matched","Stratified Future Participants")
+
+SimplifiedResultstable<- as.table(SimplifiedResults)
+
+
+kable(SimplifiedResults, format = "latex", booktabs = TRUE,
+        caption = "Simplified Results by Household Size for Matched Control and Future Participant Comparison Groups ",
+        format.args = list(big.mark= ","),
+        digits = 2) %>%
+  kable_styling(font_size = 11, latex_options = c("HOLD_position")) 
+```
+
+When including the mean household size for each census tract, no trend in energy savings is revealed.
+
+\pagebreak
+
+## Final Results
+
+After reviewing the results for the subgroup of analyses, there two results stand out: Shower wands perform better than showerheads and showerheads have greater estimated savings in the most recent period; 2017-2018
+These two results are intertwined because shower wands were primarily (&gt;90%) sent out during the
+2017-2018 time period. To focus on these two specific findings three additional regressions run and the
+program savings estimated for each. The regressions are run separately for each of the two-year time
+periods. The only explanatory variable for the 2013-2014 and 2015-2016 periods is a participation
+variable that provides an estimate of gas savings from the showerhead and aerators received. The
+regression for the 2017-2018 period also includes the additional variable shower wand to estimate the
+additional savings associated with receiving one or more shower wand.
+The savings generated by one installed showerhead and shower wand are calculated by adjusting the
+regression savings by the average number of showerheads and shower wands received by participating
+households, as well as the installation rates of showerheads and shower wands.
+
+```{r, eval=TRUE,echo=FALSE, message=FALSE, warning=FALSE, results='asis'}
+RegDataset<- RegDataset%>%
+  mutate(Installation_Rate = case_when(InstallPeriod == "2013-2014" ~ .62,
+                                       InstallPeriod == "2015-2016" ~ .49,
+                                       InstallPeriod == "2017-2018" ~ .55))
+TabledataSH<- RegDataset %>%
+  filter(RecievedSH==1)
+TabledataSW<- RegDataset %>%
+  filter(RecievedSW==1)
+
+Simpletable<- TabledataSH%>%
+  group_by(InstallPeriod) %>%
+  summarise(Installation_Rate = mean(Installation_Rate),
+              AverageSHRecieved = mean(ShowerHeadQty),
+              N = n())
+
+Simpletable1<- TabledataSW%>%
+  group_by(InstallPeriod) %>%
+  summarise(Installation_Rate = mean(Installation_Rate),
+            AverageSWRecieved = mean(ShowerWandQty),
+            N = n())
+knitr::kable(list(Simpletable, Simpletable1), format = "latex", booktabs = TRUE,
+             caption = "Average Number of Showerheads and Shower Wands Received and their Installation Rates by
+Program Period",
+             format.args = list(big.mark= ","),
+             digits = 2) %>%
+  kable_styling(font_size = 11, latex_options = c("HOLD_position"))
+```
+\pagebreak
+## The 2013-2014 and 2015-2016 Program Period
+
+As the 2013-2014 and 2015-2016 program periods had so few shower wands delivered the two models focus on participation, I.e. receiving either a showerhead or shower wand. That model is shown below:
+
+$$\text{Base Model}: Savings= \beta_0 + \beta_1X_1 +\epsilon$$
+
+where the following applies to both comparison groups:
+
+* $Savings$ = modeled_savings
+* $X_1$ = Participate, which is a dummy variable representing portfolio_type = treatment
+* $e$ = residual error
+
+```{r,echo= FALSE, message=FALSE, warning=FALSE}
+Analysisdata3<- Analysisdata3 %>%
+mutate(Participate = if_else(portfolio_type== "treatment", 1,0))
+```
+
+```{r,echo= FALSE, message=FALSE, warning=FALSE}
+
+#Analysis using matched comparison group
+RegDataset <- Analysisdata3 %>%
+  filter(portfolio_type!="stratified_future_participants")%>%
+  filter(InstallPeriod == "2013-2014")
+reg25 <- lm(modeled_savings ~ Participate,
+           data = RegDataset)
+
+#Analysis using future participant group
+RegDataset2 <- Analysisdata3 %>%
+  filter(portfolio_type!="individual_matched")%>%
+  filter(InstallPeriod == "2013-2014")
+reg26 <- lm(modeled_savings ~ Participate, 
+           data = RegDataset2)
+  
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='asis'}
+stargazer(reg25, reg26, 
+          title = "2013-2014 Regression Results for Matched Control and Future Participant Comparison Groups",
+          type = "latex",
+          column.labels = c("Matched Comparison Group","Stratified Future Participants"),
+          ci = TRUE,
+          ci.level = 0.90,
+          single.row = TRUE,
+          header = FALSE)
+```
+
+```{r,echo= FALSE, message=FALSE, warning=FALSE}
+
+#Analysis using matched comparison group
+RegDataset <- Analysisdata3 %>%
+  filter(portfolio_type!="stratified_future_participants")%>%
+  filter(InstallPeriod == "2015-2016")
+reg27 <- lm(modeled_savings ~ Participate,
+           data = RegDataset)
+
+#Analysis using future participant group
+RegDataset28 <- Analysisdata3 %>%
+  filter(portfolio_type!="individual_matched")%>%
+  filter(InstallPeriod == "2015-2016")
+reg28 <- lm(modeled_savings ~ Participate,  
+           data = RegDataset2)
+  
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='asis'}
+stargazer(reg27, reg28, 
+          title = "2015-2016 Regression Results for Matched Control and Future Participant Comparison Groups",
+          type = "latex",
+          column.labels = c("Matched Comparison Group","Stratified Future Participants"),
+          ci = TRUE,
+          ci.level = 0.90,
+          single.row = TRUE,
+          header = FALSE)
+```
+
+```{r,echo= FALSE, message=FALSE, warning=FALSE}
+MeanParticipate<- RegDataset%>%
+  filter(Participate==1)%>%
+  mutate(TotalQTY= ShowerHeadQty + ShowerWandQty)
+
+RegSummary<- as.vector(tidy(reg25))
+ParticipateMatched<- as.numeric(RegSummary[2,2])/.62/mean(MeanParticipate$TotalQTY,na.rm=TRUE)
+RegSummary1<- as.vector(tidy(reg26))
+ParticipateSHFuture<- as.numeric(RegSummary1[2,2])/.62/mean(MeanParticipate$TotalQTY, na.rm=TRUE)
+
+
+
+SimplifiedResults <- matrix(c(ParticipateMatched, ParticipateSHFuture),nrow=1)
+rownames(SimplifiedResults) <- c("Participated 2013-14")
+colnames(SimplifiedResults) <- c("Individual Matched","Stratified Future Participants")
+
+SimplifiedResultstable<- as.table(SimplifiedResults)
+
+
+RegSummary<- as.vector(tidy(reg27))
+ParticipateMatched<- as.numeric(RegSummary[2,2])/.49/mean(MeanParticipate$TotalQTY,na.rm=TRUE)
+RegSummary1<- as.vector(tidy(reg28))
+ParticipateSHFuture<- as.numeric(RegSummary1[2,2])/.49/mean(MeanParticipate$TotalQTY, na.rm=TRUE)
+
+
+
+SimplifiedResults <- matrix(c(ParticipateMatched, ParticipateSHFuture),nrow=1)
+rownames(SimplifiedResults) <- c("Participated 2015-16")
+colnames(SimplifiedResults) <- c("Individual Matched","Stratified Future Participants")
+
+SimplifiedResultstable1<- as.table(SimplifiedResults)
+
+
+kable(list(SimplifiedResultstable, SimplifiedResultstable1), format = "latex", booktabs = TRUE,
+        caption = " Therm Savings Estimates for a Single Installed Showerhead and Shower Wand for the 2013-2014 and 2015-2016 Program Periods Using the Matched Control and Future Participant Comparison Groups",
+        format.args = list(big.mark= ","),
+        digits = 2) %>%
+  kable_styling(font_size = 11, latex_options = c("HOLD_position")) 
+
+
+```
+The models for each of the two program periods indicate that the showerheads, shower wands and aerators that were delivered during the four-year period did not result in gas savings. The estimated regression coefficients are either negative (3 of the 4) or positive but not significantly different from zero. The installed showerhead savings calculated from these regressions results in negligible to zero savings.
+\pagebreak
+
+## 2017-2018 Program Period
+
+The 2017-2018 regression model splits out the showerhead and shower wand as over 90% of the shower wands were delivered during this period. The model is specified as:
+
+$$\text{Base Model}: Savings= \beta_0 + \beta_1X_1 + \beta_2X_2 + \epsilon$$
+
+where the following applies to both comparison groups:
+
+* $Savings$ = modeled_savings
+* $X_1$ = RecievedSH, which is a dummy variable representing homes which recieved showerheads and is set to zero for the comparison homes
+* $X_2$ = RecievedSW, which is a dummy variable representing homes which recieved shower wands and is set to zero for the comparison homes.
+* $e$ = residual error
+
+```{r,echo= FALSE, message=FALSE, warning=FALSE}
+
+#Analysis using matched comparison group
+RegDataset <- Analysisdata3 %>%
+  filter(portfolio_type!="stratified_future_participants")%>%
+  filter(InstallPeriod == "2017-2018")
+reg21 <- lm(modeled_savings ~ RecievedSH + RecievedSW, 
+           data = RegDataset)
+
+#Analysis using future participant group
+RegDataset2 <- Analysisdata3 %>%
+  filter(portfolio_type!="individual_matched")%>%
+  filter(InstallPeriod == "2017-2018")
+reg22 <- lm(modeled_savings ~ RecievedSH + RecievedSW, 
+           data = RegDataset2)
+  
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='asis'}
+stargazer(reg21, reg22, 
+          title = "2017-2018 Overall Regression Results for Matched Control and Future Participant Comparison Groups",
+          type = "latex",
+          column.labels = c("Matched Comparison Group","Stratified Future Participants"),
+          ci = TRUE,
+          ci.level = 0.90,
+          single.row = TRUE,
+          header = FALSE)
+```
+
+```{r,echo= FALSE, message=FALSE, warning=FALSE}
+TabledataSH<- TabledataSH%>%
+  filter(InstallPeriod == "2017-2018")%>%
+  filter(RecievedSH ==1)
+
+TabledataSW<- TabledataSW%>%
+  filter(InstallPeriod == "2017-2018")%>%
+  filter(RecievedSW ==1)
+
+RegSummary<- as.vector(tidy(reg21))
+RecievedSHMatched1<- as.numeric(RegSummary[2,2])/.55/mean(TabledataSH$ShowerHeadQty,na.rm=TRUE)
+RecievedSWMatched1<- as.numeric(RegSummary[3,2])/.55/mean(TabledataSW$ShowerWandQty,na.rm=TRUE)
+
+RegSummary1<- as.vector(tidy(reg22))
+RecievedSHFuture1<- as.numeric(RegSummary1[2,2])/.55/mean(TabledataSH$ShowerHeadQty, na.rm=TRUE)
+RecievedSWFuture2<- as.numeric(RegSummary1[3,2])/.55/mean(TabledataSW$ShowerWandQty, na.rm=TRUE)
+
+
+SimplifiedResults <- matrix(c(RecievedSHMatched1,RecievedSWMatched1,
+                              RecievedSHFuture1,
+                              RecievedSWFuture2),nrow=2)
+rownames(SimplifiedResults) <- c("InstallSH", "InstallSW")
+colnames(SimplifiedResults) <- c("Individual Matched","Stratified Future Participants")
+
+SimplifiedResultstable<- as.table(SimplifiedResults)
+
+
+kable(SimplifiedResults, format = "latex", booktabs = TRUE,
+        caption = "Results for Showerhead and Shower Wand Installed for Matched Control and Future Participant Comparison Groups",
+        format.args = list(big.mark= ","),
+        digits = 2) %>%
+  kable_styling(latex_options = c("HOLD_position"), font_size = 11) 
+```
+The results of the 2017-2018 program period stand in stark contrast with the models for the two earlier periods.  In the 2017-2018 period the ESKs were estimated to generate 4.4 therm savings. For each shower wand that was delivered an additional 7.7 therm savings was estimated. Savings estimates using the future participant group are higher but the number of future participants for this time period is significantly smaller. We therefore focus on the results of the matched comparison group. When adjusting the savings for installation rates and more than one product being delivered the savings associated with an installed showerhead are 5.3 therms and those of an installed shower wand 14.08.
+
+\pagebreak
+
+
+```{r,echo= FALSE, message=FALSE, warning=FALSE}
+#$$\text{Base Model}: Savings= \beta_0 + \beta_1X_1 + \beta_2X_2 + \beta_3X_3 + \epsilon$$
+
+#where the following applies to both comparison groups:
+
+#* $Savings$ = modeled_savings
+#* $X_1$ = OnlySH, which is a dummy variable representing homes which recieved only showerheads and is set to zero for the #comparison homes
+#* $X_2$ = OnlySW, which is a dummy variable representing homes which only recieved shower wands and is set to zero for the comparison homes
+#* $X_3$ = Both, which is a dummy variable representing homes which recieved both a showerhead and a shower wand.
+#* $e$ = residual error
+#Analysisdata3<- Analysisdata3%>%
+  #mutate(OnlySH = if_else(RecievedSH==1 & RecievedSW==0,1,0))%>%
+  #mutate(OnlySW = if_else(RecievedSH==0 & RecievedSW==1,1, 0))%>%
+  #mutate(Both = if_else(RecievedSH==1 & RecievedSW==1,1, 0))
+```
+
+```{r,echo= FALSE, message=FALSE, warning=FALSE}
+
+#Analysis using matched comparison group
+#RegDataset <- Analysisdata3 %>%
+  #filter(portfolio_type!="stratified_future_participants")%>%
+  #filter(InstallPeriod == "2017-2018")
+#reg23 <- lm(modeled_savings ~ OnlySH + OnlySW + Both,
+           #data = RegDataset)
+
+#Analysis using future participant group
+#RegDataset2 <- Analysisdata3 %>%
+  #filter(portfolio_type!="individual_matched")%>%
+  #filter(InstallPeriod == "2017-2018")
+#reg24 <- lm(modeled_savings ~ OnlySH + OnlySW + Both, 
+           #data = RegDataset2)
+  
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='asis'}
+#stargazer(reg23, reg24, 
+          #title = "2017-2018 Regression Results for SH and SW Installed for Matched Control and Future Participant Comparison Groups",
+          #type = "latex",
+          #column.labels = c("Matched Comparison Group","Stratified Future Participants"),
+          #ci = TRUE,
+          #ci.level = 0.90,
+          #single.row = TRUE,
+          #header = FALSE)
+```
+
+```{r,echo= FALSE, message=FALSE, warning=FALSE}
+#ShowerHeadMean<- RegDataset%>%
+  #filter(OnlySH==1)
+#ShowerWandMean<- RegDataset%>%
+  #filter(OnlySW==1)
+#BothMean<- RegDataset%>%
+  #filter(Both==1)
+
+
+#RegSummary<- as.vector(tidy(reg23))
+#RecievedSHMatched1<- as.numeric(RegSummary[2,2])/.55/mean(ShowerHeadMean$ShowerHeadQty,na.rm=TRUE)
+#RecievedSWMatched1<- as.numeric(RegSummary[3,2])/.55/mean(ShowerWandMean$ShowerWandQty,na.rm=TRUE)
+#RecievedBothMatched<- as.numeric(RegSummary[4,2])/.55/mean(BothMean$ShowerWandQty,na.rm=TRUE)/mean(BothMean$ShowerHeadQty,na.rm=TRUE)
+  
+#RegSummary1<- as.vector(tidy(reg24))
+#RecievedSHFuture1<- as.numeric(RegSummary1[2,2])/.55/mean(ShowerHeadMean$ShowerHeadQty,na.rm=TRUE)
+#RecievedSWFuture2<- as.numeric(RegSummary1[3,2])/.55/mean(ShowerWandMean$ShowerWandQty,na.rm=TRUE)
+#RecievedBothFuture<- as.numeric(RegSummary1[4,2])/.55/mean(BothMean$ShowerWandQty,na.rm=TRUE)/mean(BothMean$ShowerHeadQty,na#.rm=TRUE)
+
+#SimplifiedResults <- matrix(c(RecievedSHMatched1,RecievedSWMatched1,RecievedBothMatched,
+                              #RecievedSWFuture1,
+                              #RecievedSWFuture2, RecievedBothFuture),nrow=3)
+#rownames(SimplifiedResults) <- c("InstallOnlySH", "InstallOnlySW", "InstalledBoth")
+#colnames(SimplifiedResults) <- c("Individual Matched","Stratified Future Participants")
+
+#SimplifiedResultstable<- as.table(SimplifiedResults)
+
+
+#kable(SimplifiedResults, format = "latex", booktabs = TRUE,
+        #caption = "Results for Showerhead and Showerwand Installed for Matched Control and Future Participant Comparison Groups ",
+        #format.args = list(big.mark= ","),
+        #digits = 2) %>%
+  #kable_styling(font_size = 11, latex_options = c("HOLD_position")) 
+```
+
+
+## Conclusion
+
+The Recurve analysis is by its nature quite simple as it is a comparison of means. The regressions analyses done in this report are also quite simple but add some additional insight into the results by segmenting the analysis with available characteristics data. Analyzing the program’s different time periods indicated that estimated ESK savings were considerably higher in the later period possibly indicating differences in  program delivery. Differentiating between showerheads and shower wands also led to different estimates of savings. The other regressions that split the analysis on geography, site specific characteristics, census tract characteristics did not reveal other significant factors that influenced savings estimates for the showerheads or shower wands.
